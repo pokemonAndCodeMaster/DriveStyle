@@ -5,7 +5,7 @@ class StyleIdentifier:
     """
     基于多宇宙假设检验的跟车风格辨识器
     """
-    def __init__(self, target_thws=[1.0, 1.5, 2.0], window_size=150, lambda_default=1.0):
+    def __init__(self, target_thws=[1.0, 1.5, 2.0], window_size=100, lambda_default=1.0):
         self.target_thws = target_thws
         self.window_size = window_size
         self.lambda_default = lambda_default
@@ -14,6 +14,9 @@ class StyleIdentifier:
         """
         输入单段轨迹数据，输出窗口级的辨识结果
         """
+        if df.empty or len(df) < self.window_size:
+            return pd.DataFrame()
+
         # 1. 基础物理量计算
         df = df.copy()
         df['dv'] = df['v_lv'] - df['v_ev']
@@ -25,7 +28,9 @@ class StyleIdentifier:
         
         results = []
         # 3. 滑动窗口积分
-        for i in range(0, len(df) - self.window_size, 50): # 窗口平移步长50
+        # 动态步长：取窗口的 1/5，确保曲线平滑
+        step = max(1, self.window_size // 5)
+        for i in range(0, len(df) - self.window_size + 1, step):
             window = df.iloc[i : i + self.window_size].copy()
             costs = {}
             valid_mask_counts = {}
@@ -46,15 +51,21 @@ class StyleIdentifier:
             # 赢家通吃：选择残差最小的模型作为辨识结果
             best_thw = min(costs, key=costs.get)
             
-            results.append({
+            res_item = {
                 "start_time": window['timestamp'].iloc[0],
+                "end_time": window['timestamp'].iloc[-1],
                 "identified_style": best_thw,
-                "cost_1.0": costs[1.0],
-                "cost_1.5": costs[1.5],
-                "cost_2.0": costs[2.0],
                 "valid_ratio": valid_mask_counts[best_thw],
-                "gt_style": window['gt_style'].iloc[0],
-                "scenario": window['scenario'].iloc[0]
-            })
+            }
+            # Add all costs for visualization
+            for thw_k, c in costs.items():
+                res_item[f"cost_{thw_k}"] = c
+            
+            if 'gt_style' in window.columns:
+                res_item["gt_style"] = window['gt_style'].iloc[0]
+            if 'scenario' in window.columns:
+                res_item["scenario"] = window['scenario'].iloc[0]
+                
+            results.append(res_item)
             
         return pd.DataFrame(results)
