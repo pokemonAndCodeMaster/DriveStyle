@@ -6,13 +6,13 @@ from src.domain.models import CarFollowingSegment
 
 class SecondOrderStyleIdentifier(BaseIdentifier):
     """
-    基于二阶控制理论与物理约束的前馈跟车风格辨识器 (V9.1 物理一致性校准版)
+    基于二阶控制理论与物理约束的前馈跟车风格辨识器 (V13.1 物理基准归零版)
     """
     def __init__(self, 
                  styles_config: Dict[float, Dict[str, float]] = None,
                  window_size: int = 100, 
                  dt: float = 0.1, 
-                 d0: float = 5.0, 
+                 d0: float = 0.0, # 强制默认为 0，消除时距漂移
                  jerk_max: float = 2.5, 
                  a_max: float = 3.0, 
                  a_min: float = -5.0,
@@ -29,127 +29,86 @@ class SecondOrderStyleIdentifier(BaseIdentifier):
         self.jerk_max = jerk_max
         self.a_max = a_max
         self.a_min = a_min
-        self.zeta = zeta
+        self.zeta = zeta # 全局默认阻尼比
         
         self.params = {}
         for thw, conf in self.styles_config.items():
             wn = conf.get('wn', 0.6)
-            denom = 1 + 2 * self.zeta * wn * thw
+            z = conf.get('zeta', self.zeta)
+            denom = 1 + 2 * z * wn * thw
             self.params[thw] = {
                 'tau': thw / denom if denom != 0 else 0.001,
                 'alpha': 1.0 / denom,
-                'Kv': (2 * self.zeta * wn) / denom,
+                'Kv': (2 * z * wn) / denom,
                 'Kp': (wn ** 2) / denom,
-                'wn': wn
+                'wn': wn,
+                'zeta': z
             }
 
-    def simulate_segment(self, segment: CarFollowingSegment, thw: float, wn: float) -> np.ndarray:
+    def simulate_segment(self, segment: CarFollowingSegment, thw: float, wn: float, zeta: float = 1.0) -> Dict[str, np.ndarray]:
         df = segment.to_dataframe()
         N = len(df)
-        a_sim = np.zeros(N)
-        if N == 0: return a_sim
-        
-        v_ego = df['ego_velocity'].values
-        v_lead = df['lead_velocity'].values
-        a_lead = df['lead_acceleration'].values
-        dist = df['relative_distance'].values
-        
-        denom = 1 + 2 * self.zeta * wn * thw
-        p = {'tau': thw / denom, 'alpha': 1.0 / denom, 'Kv': (2 * self.zeta * wn) / denom, 'Kp': (wn ** 2) / denom}
-        
-        a_sim[0] = df['ego_acceleration'].values[0]
-        v_tmp, d_tmp = v_ego[0], dist[0]
-        
+        a_sim, v_sim, d_sim = np.zeros(N), np.zeros(N), np.zeros(N)
+        if N == 0: return {}
+        v_ego, v_lead = df['ego_velocity'].values, df['lead_velocity'].values
+        a_lead, dist = df['lead_acceleration'].values, df['relative_distance'].values
+        denom = 1 + 2 * zeta * wn * thw
+        p = {'tau': thw / denom, 'alpha': 1.0 / denom, 'Kv': (2 * zeta * wn) / denom, 'Kp': (wn ** 2) / denom}
+        a_sim[0], v_sim[0], d_sim[0] = df['ego_acceleration'].values[0], v_ego[0], dist[0]
         for t in range(1, N):
-            e = d_tmp - (thw * v_tmp + self.d0)
-            dv = v_lead[t] - v_tmp
+            e = d_sim[t-1] - (thw * v_sim[t-1] + self.d0)
+            dv = v_lead[t] - v_sim[t-1]
             a_cmd = p['alpha'] * a_lead[t] + p['Kv'] * dv + p['Kp'] * e
-            
             a_raw = a_sim[t-1] + (self.dt / p['tau']) * (a_cmd - a_sim[t-1])
             j_lim = np.clip((a_raw - a_sim[t-1]) / self.dt, -self.jerk_max, self.jerk_max)
             a_sim[t] = np.clip(a_sim[t-1] + j_lim * self.dt, self.a_min, self.a_max)
-            
-            v_tmp += a_sim[t] * self.dt
-            d_tmp += (v_lead[t] - v_tmp) * self.dt
-            
-        return a_sim
+            v_sim[t] = v_sim[t-1] + a_sim[t] * self.dt
+            d_sim[t] = d_sim[t-1] + (v_lead[t] - v_sim[t]) * self.dt
+        return {'acc': a_sim, 'v': v_sim, 'thw': d_sim / np.clip(v_sim, 0.5, 100.0)}
 
     def identify(self, segment: CarFollowingSegment) -> pd.DataFrame:
         df = segment.to_dataframe()
         N = len(df)
         if N < self.window_size: return pd.DataFrame()
-
-        pred_horizon = 20 # 2.0s
+        max_pred_steps = 100 
         results = []
-        step = 1
-        
-        v_ego, v_lead = df['ego_velocity'].values, df['lead_velocity'].values
-        a_ego, a_lead = df['ego_acceleration'].values, df['lead_acceleration'].values
-        dist, timestamps = df['relative_distance'].values, df['timestamp'].values
-        
-        for start_idx in range(0, N - self.window_size + 1, step):
-            end_idx = start_idx + self.window_size
-            window_rays, window_acc_rays = {}, {} 
-            cost, valid_ratio = {}, {}
-            
+        v_ev_arr, v_lv_arr = df['ego_velocity'].values, df['lead_velocity'].values
+        a_ev_arr, a_lv_arr = df['ego_acceleration'].values, df['lead_acceleration'].values
+        dist_arr, timestamps = df['relative_distance'].values, df['timestamp'].values
+        for start_idx in range(0, N - self.window_size + 1, 1):
+            window_rays, window_acc_rays, cost, valid_ratio = {}, {}, {}, {}
             for thw, p in self.params.items():
-                # 1. 成本辨识模拟
                 a_sim_w = np.zeros(self.window_size)
-                a_sim_w[0] = a_ego[start_idx]
-                v_w, d_w = v_ego[start_idx], dist[start_idx]
-                valid_count = 0
-                
+                a_sim_w[0], v_w, d_w, valid_count = a_ev_arr[start_idx], v_ev_arr[start_idx], dist_arr[start_idx], 0
                 for t in range(1, self.window_size):
                     idx = start_idx + t
                     e = d_w - (thw * v_w + self.d0)
-                    dv = v_lead[idx] - v_w
-                    a_cmd = p['alpha'] * a_lead[idx] + p['Kv'] * dv + p['Kp'] * e
-                    
+                    dv = v_lv_arr[idx] - v_w
+                    a_cmd = p['alpha'] * a_lv_arr[idx] + p['Kv'] * dv + p['Kp'] * e
                     a_raw = a_sim_w[t-1] + (self.dt / p['tau']) * (a_cmd - a_sim_w[t-1])
                     j_lim = np.clip((a_raw - a_sim_w[t-1]) / self.dt, -self.jerk_max, self.jerk_max)
                     a_sim_w[t] = np.clip(a_sim_w[t-1] + j_lim * self.dt, self.a_min, self.a_max)
-                    
-                    v_w += a_sim_w[t] * self.dt
-                    d_w += (v_lead[idx] - v_w) * self.dt
-                    
-                    if not ((e < -2.0 and a_cmd < -0.5 and a_ego[idx] > 0.5) or 
-                            (e > 2.0 and a_cmd > 0.5 and a_ego[idx] < -0.5)):
-                        valid_count += 1
-
-                cost[thw] = np.mean(np.abs(a_ego[start_idx:end_idx] - a_sim_w))
+                    v_w += a_sim_w[t] * self.dt; d_w += (v_lv_arr[idx] - v_w) * self.dt
+                    if not ((e < -2.0 and a_cmd < -0.5 and a_ev_arr[idx] > 0.5) or (e > 2.0 and a_cmd > 0.5 and a_ev_arr[idx] < -0.5)): valid_count += 1
+                cost[thw] = np.mean(np.abs(a_ev_arr[start_idx:start_idx+self.window_size] - a_sim_w))
                 valid_ratio[thw] = valid_count / (self.window_size - 1)
-
-                # 2. 预测射线推演 (2.0s)
-                sim_len = min(pred_horizon, N - start_idx)
-                thw_r, acc_r = np.zeros(sim_len), np.zeros(sim_len)
-                v_r, d_r, a_p = v_ego[start_idx], dist[start_idx], a_ego[start_idx]
-                thw_r[0], acc_r[0] = d_r / max(0.5, v_r), a_p
-
-                for t in range(1, sim_len):
-                    idx = start_idx + t
-                    e_r = d_r - (thw * v_r + self.d0)
-                    dv_r = v_lead[idx] - v_r
-                    a_c_r = p['alpha'] * a_lead[idx] + p['Kv'] * dv_r + p['Kp'] * e_r
-                    
-                    a_raw_r = a_p + (self.dt / p['tau']) * (a_c_r - a_p)
-                    j_r = np.clip((a_raw_r - a_p) / self.dt, -self.jerk_max, self.jerk_max)
-                    a_curr = np.clip(a_p + j_r * self.dt, self.a_min, self.a_max)
-                    
-                    v_r += a_curr * self.dt
-                    d_r += (v_lead[idx] - v_r) * self.dt
-                    thw_r[t], acc_r[t] = d_r / max(0.5, v_r), a_curr
-                    a_p = a_curr
                 
-                window_rays[thw], window_acc_rays[thw] = thw_r, acc_r
-                
+                # 稳态推演射线
+                thw_r, acc_r = [], []
+                v_curr, d_curr, a_prev_r = v_ev_arr[start_idx], dist_arr[start_idx], a_ev_arr[start_idx]
+                for t in range(max_pred_steps):
+                    idx = min(start_idx + t, N-1)
+                    curr_a_lv, curr_v_lv = a_lv_arr[idx], v_lv_arr[idx]
+                    e_r = d_curr - (thw * v_curr + self.d0)
+                    dv_r = curr_v_lv - v_curr
+                    a_cmd_r = p['alpha'] * curr_a_lv + p['Kv'] * dv_r + p['Kp'] * e_r
+                    a_raw_r = a_prev_r + (self.dt / p['tau']) * (a_cmd_r - a_prev_r)
+                    j_r = np.clip((a_raw_r - a_prev_r) / self.dt, -self.jerk_max, self.jerk_max)
+                    a_curr_r = np.clip(a_prev_r + j_r * self.dt, self.a_min, self.a_max)
+                    v_curr += a_curr_r * self.dt; d_curr += (curr_v_lv - v_curr) * self.dt
+                    thw_r.append(d_curr / max(0.5, v_curr)); acc_r.append(a_curr_r); a_prev_r = a_curr_r
+                    if t > 30 and abs(e_r) < 0.05 and abs(dv_r) < 0.05: break
+                window_rays[thw], window_acc_rays[thw] = np.array(thw_r), np.array(acc_r)
             best_thw = min(cost, key=cost.get)
-            results.append({
-                "start_time": timestamps[start_idx],
-                "identified_style": best_thw,
-                "valid_ratio": valid_ratio[best_thw],
-                "rays": window_rays,
-                "acc_rays": window_acc_rays,
-                **{f"cost_{k}": v for k, v in cost.items()}
-            })
-            
+            results.append({"start_time": timestamps[start_idx], "identified_style": best_thw, "valid_ratio": valid_ratio[best_thw], "rays": window_rays, "acc_rays": window_acc_rays, **{f"cost_{k}": v for k, v in cost.items()}})
         return pd.DataFrame(results)
