@@ -1,0 +1,42 @@
+# DriveStyle 全球参数配置中心
+
+# 物理模型参数
+physics:
+  dt: 0.1
+  d0: 0.0
+  jerk_max: 2.5
+  a_max: 3.0
+  a_min: -5.0
+  zeta_default: 1.0
+
+# 辨识算法配置
+identification:
+  window_size_default: 100
+  pred_horizon: 100  # 10s
+  targets:
+    thw: [1.0, 1.5, 2.0]
+    wn: [0.4, 0.8, 1.4]
+    zeta: [0.7, 1.0, 1.5]
+
+# 可视化样式配置
+visualization:
+  theme: "whitegrid"
+  dpi: 300
+  colors:
+    ego: "#2980b9"
+    lead: "#95a5a6"
+    actual_acc: "#8e44ad"
+    actual_thw: "#2c3e50"
+    styles:
+      1.0: "#e74c3c"
+      1.5: "#f39c12"
+      2.0: "#27ae60"
+  layout:
+    canvas_width: 28
+    row_height: 6
+
+# 实验与扫参配置
+experiment:
+  window_sizes_test: [1.0, 3.0]
+  output_dir: "output/figures/"
+  report_dir: "output/data/"

@@ -1,60 +1,51 @@
-# 辨识算法模块
+# 辨识算法深度解析
 
-**辨识算法模块 (Identification Module)** 是 DriveStyle 项目的算法核心。它通过 **基于物理驱动的多假设残差检验 (Reversed-Physics Multi-Hypothesis Testing)** 来推演驾驶员的目标跟车时距 (THW) 风格。
+**辨识算法层 (Identification Layer)** 是 DriveStyle 的核心大脑。它通过 **基于物理驱动的多假设残差检验** 算法，逆向推演驾驶员的真实意图。
 
-## 🚀 核心理念：“逆向控制器”
+## 📐 二阶控制律数学推导
 
-在自动驾驶控制中，跟车模型通常基于目标 THW *生成* 加速度。而本辨识器则是 *反向* 这一过程：它观测实际加速度，并判断哪一个“假设的目标 THW”能最好地解释该观测行为。
+我们假设驾驶员的行为符合二阶阻尼振子系统。误差 $e$ 的衰减方程为：
+$$\ddot{e} + 2\zeta\omega_n \dot{e} + \omega_n^2 e = 0$$
 
-### 📐 物理建模基础
+通过对空间误差 $e = \Delta x - THW \cdot v_{ego}$ 进行求导并代入，我们推导出自车加速度指令：
+$$a_{cmd} = \alpha a_{lead} + K_v \Delta v + K_p e$$
 
-我们将观测到的自车加速度 $a_{\text{ego}}$ 分解为两个物理分量：
-1.  **随动基线力 ($a_{\text{base}}$)**: 仅维持当前状态不改变目标风格所需的力。
-2.  **主动纠偏力 ($f_{\text{actual}}$)**: 驾驶员为了缩减或拉大间距以达到其心理预期 THW 的主动意图表现。
+其中关键系数：
+-   $\alpha = 1 / (1 + 2\zeta\omega_n THW)$：前馈响应系数。
+-   $\tau = THW \cdot \alpha$：系统一阶滞后时间常数。
 
-推导公式：
-$$f_{\text{actual}} = a_{\text{ego}} - \frac{v_{\text{lead}} - v_{\text{ego}}}{\text{THW}_{\text{obs}}}$$
+## 🔄 10s 稳态长程推演逻辑
 
-## 🏗️ 多宇宙假设检验策略
+为了验证参数的物理合理性，系统引入了 **长程推演 (Spaghetti Plots)** 功能。
 
-算法在三个平行的“候选宇宙”中计算预期纠偏力：
-- **激进型宇宙** (目标 THW = 1.0s)
-- **标准型宇宙** (目标 THW = 1.5s)
-- **保守型宇宙** (目标 THW = 2.0s)
+### 算法步骤
+1.  **起始对齐**：从当前观测时刻 $t_0$ 的真实 $v, dist, a$ 出发。
+2.  **预测外推**：如果未来数据缺失，假设前车保持最后的运动状态。
+3.  **闭环积分**：
+    -   每一帧根据当前规划的 $a_{sim}$ 更新自车状态。
+    -   计算下一帧的误差并反馈至控制器。
+4.  **收敛判定**：推演持续 10 秒，或直到误差进入 5% 的稳态带。
 
-在每个滑动窗口内，算法计算实际纠偏力与各宇宙理想纠偏力之间的 **平均绝对残差 (Residue Cost)**。残差最小的宇宙即被判定为该时段的驾驶风格。
-
-## 📦 核心类：`StyleIdentifier`
-
-`StyleIdentifier` 利用 NumPy 和 Pandas 实现了高效的向量化计算。
+## 📦 `SecondOrderStyleIdentifier` 类
 
 ```mermaid
 classDiagram
-    class StyleIdentifier {
-        +target_thws : List[float]
-        +window_size : int
-        +lambda_default : float
-        +identify(df: DataFrame) : DataFrame
-    }
+class SecondOrderStyleIdentifier {
+  +params : Dict
+  +styles_config : Dict
+  +identify(segment : CarFollowingSegment) DataFrame
+  +simulate_segment(segment, thw, wn, zeta) Dict
+  +step_physics(state, cmd_p, thw_target) Dict
+}
 ```
 
-### `identify` API 详解
-- **输入**: 包含 `timestamp`, `v_ev`, `v_lv`, `dist`, `a_ev` 的 DataFrame。
-- **输出**: 包含以下字段的结果 DataFrame：
-    - `start_time`, `end_time`: 窗口起止时间。
-    - `identified_style`: 辨识出的 THW (如 1.0, 1.5, 2.0)。
-    - `cost_1.0`, `cost_1.5`, `cost_2.0`: 各假设下的原始残差值。
-    - `valid_ratio`: 意图一致性评分（用于评估结果的可信度）。
-
-## 💡 最佳实践与调优
-
-1.  **窗口长度 (window_size)**: 推荐设置为 100-150 帧 (对于 10Hz 数据，即 10-15s)。较长的窗口能过滤偶然波动，较短的窗口能捕捉风格切换。
-2.  **动态步长**: 默认步长取窗口的 1/5。在处理极短片段时，算法会自动减小步长以确保输出足够的连续决策点。
-3.  **意图过滤**: 辨识器内部集成了 `valid_ratio` 校验。如果驾驶员的操作在物理语义上与假设意图完全相反（例如太近了还在加速），该点会被标记为不可信。
+### 核心 API 说明 [📄](file://src/identification/second_order_id.py)
+- **`identify`**: 核心辨识接口。输出包含 `rays` (THW 射线) 和 `acc_rays` (加速射线) 的 DataFrame。
+- **`simulate_segment`**: 用于生成全局对比曲线。
 
 ---
 
 **章节参考源**
-- [src/identification/car_following_id.py](file://src/identification/car_following_id.py)
+- [src/identification/second_order_id.py](file://src/identification/second_order_id.py)
 
 *由 [Mini-Wiki v3.0.6](https://github.com/trsoliu/mini-wiki) 自动生成 | 2026-03-14*

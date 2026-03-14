@@ -1,78 +1,63 @@
 # DriveStyle 项目维基
 
-欢迎来到 **DriveStyle** 项目！本项目提供了一个优雅、模块化且高保真的框架，用于 **跟车驾驶风格辨识 (Car-Following Driving Style Identification)**。
+欢迎使用 **DriveStyle** 旗舰版驾驶风格研判系统 (V14.0)。本项目是一个高度工程化的、基于物理信息的自动驾驶数据研判框架。
 
-> **核心愿景**：通过物理信息机器学习与多模型假设检验，将原始的车辆运动数据转化为可落地的驾驶意图洞察。
+> **核心价值**：将复杂的交通流数据转化为可量化、可追溯的驾驶员“性格特征”资产。
 
-## 🚀 项目概述
+## 🚀 研判看板一览
 
-DriveStyle 专为自动驾驶研发与交通流研究设计。通过“逆向控制”物理逻辑，即使在存在感知噪声或动态波动的真实工况下，也能精准识别驾驶员的目标跟车时距 (THW)。
+本项目目前支持从 **“全局地形”** 到 **“微观推演”** 的全谱段研判：
 
-### 🌟 核心特性
+| 看板类型 | 物理意义 | 应用场景 |
+|----------|----------|---------|
+| **敏感度热力图** | $MAE = f(\omega_n, \zeta)$ | 寻找最优参数区间，分析性格与误差的敏感度。 |
+| **长程稳态射线** | $\text{THW}_{future} = \int \int a_{sim} dt$ | 验证算法意图的收敛性与物理自洽性。 |
+| **加速度规划图** | $a_{sim}$ 滚动规划 | 剖析虚拟驾驶员的“脚法”细节。 |
+| **量化评估主表** | SSE, SettleTime, JerkVar | 工业级指标审计与定性性格打标。 |
 
-| 特性 | 详细描述 |
-|---------|-------------|
-| **多源数据加载** | 采用工厂模式，原生支持 CSV 仿真轨迹与复杂的 JSON 感知片段读取。 |
-| **鲁棒片段提取** | 自动识别跟车状态，根据目标 ID 与连续性策略提取高质量的跟车 Clip。 |
-| **多模型假设检验** | 反向推演 1.0s, 1.5s, 2.0s 等不同 THW 风格在当前运动学下的理论残差。 |
-| **超融合可视化** | 5 面板动力学与决策联合分析图，直观展示速度、距离、加速度、残差演化与判定阶梯。 |
-| **批量自动化验证** | 一键执行用例集测试，自动输出混淆矩阵、风格分布与批量 CSV 报表。 |
+## 🏗️ 软件分层架构
 
-## 🏗️ 系统架构图
-
-DriveStyle 遵循 **领域驱动设计 (DDD)** 架构，确保代码的高内约与低耦合。
+系统采用 **领域驱动设计 (DDD)** 结合 **配置驱动 (Config-Driven)** 的分层模式：
 
 ```mermaid
 flowchart TB
-    subgraph 基础设施层 [Infrastructure]
-        LoaderFactory[数据加载工厂]
-        CSVLoader[CSV 加载器]
-        JSONLoader[JSON 加载器]
+    subgraph Config[配置层]
+        Yaml[default_config.yaml]
+        Manager[ConfigManager]
     end
 
-    subgraph 应用服务层 [Application]
-        Service[辨识编排服务]
+    subgraph App[应用层]
+        Runner[ExperimentRunner]
+        Diag[DiagnosticService]
     end
 
-    subgraph 领域核心层 [Domain]
-        Models[跟车片段/车辆实体]
-        Interfaces[加载器/辨识器接口]
+    subgraph Domain[领域层]
+        Models[Vehicle / Segment]
+        Interface[BaseIdentifier]
     end
 
-    subgraph 算法层 [Identification]
-        Algo[风格辨识算法]
+    subgraph Core[核心物理层]
+        Physics[StepPhysics 原子步进]
     end
 
-    subgraph 工具层 [Utils]
-        Viz[Matplotlib 可视化器]
+    subgraph Algo[辨识算法层]
+        SOID[SecondOrderStyleIdentifier]
     end
 
-    JSONLoader --> Models
-    CSVLoader --> Models
-    Service --> LoaderFactory
-    Service --> Algo
-    Service --> Viz
-    Algo --> Models
+    Yaml --> Manager
+    Manager --> SOID
+    Runner --> SOID
+    SOID --> Physics
+    SOID --> Models
 ```
 
-## 📖 导航文档
+## 📖 技术导航
 
-| 文档名称 | 受众群体 | 核心价值 |
-|----------|----------|---------|
-| [系统架构设计](./architecture.md) | 架构师 / 核心开发 | 模块化设计、数据流向与 DDD 实践。 |
-| [辨识算法模块](./modules/identification.md) | 算法工程师 | 逆向物理残差、多宇宙竞争机制详解。 |
-| [快速开始与脚本指南](./getting-started.md) | 用户 / 测试工程师 | 模拟用例生成、单例调试与批量验证 SOP。 |
-| [基础设施加载](./modules/infrastructure.md) | 数据工程师 | 扩展自定义 JSON 协议或新数据源指南。 |
-
-## 🛠️ 典型工作流
-
-```python
-# 单个 JSON 片段深度辨识与可视化 (生成 5 面合一超融合图)
-python3 scripts/run_single_case.py --file debug.json
-
-# 批量执行 tests/ 目录下的所有用例并输出统计报表
-python3 scripts/run_batch_cases.py --dir tests/data --plot_limit 5
-```
+- **[系统架构设计](./architecture.md)**：深入了解分层解耦与单例配置。
+- **[核心物理与配置](./modules/core.md)**：物理步进的一致性保证与 YAML 字典。
+- **[辨识算法深度解析](./modules/identification.md)**：二阶微分方程推导与 10s 稳态推演逻辑。
+- **[可视化框架说明](./modules/visualization.md)**：28x36 高清全景画布的组件化实现。
+- **[快速上手 SOP](./getting-started.md)**：从 `debug.json` 到量化报表的完整工作流。
 
 ---
 

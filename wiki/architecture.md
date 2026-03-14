@@ -1,103 +1,67 @@
 # 系统架构设计
 
-**DriveStyle** 项目采用了模块化、领域驱动的架构设计，旨在解耦数据提取、算法辨识与结果呈现层。
+DriveStyle V14.0 采用高度抽象的模块化架构，旨在为大规模跟车数据提供具备 **“物理强一致性”** 的研判环境。
 
-## 🏗️ 分层架构概览
+## 🏗️ 分层模型深度解剖
 
-系统分为以下四个核心层级：
+### 1. 配置层 (Configuration Layer)
+通过单例模式的 `ConfigManager` 统一管理所有的外部配置。
+- **价值**：杜绝了代码中的“魔法数字”，支持实验人员在不触碰核心逻辑的情况下调节 $\omega_n, \zeta$ 等超参数。
+- **文件**：`config/default_config.yaml` | [config_manager.py](file://src/core/config_manager.py)
 
-1.  **基础设施层 (Infrastructure)**: 负责数据 I/O。将异构数据格式（CSV, JSON 等）转换为统一的领域实体。
-2.  **领域层 (Domain)**: 包含核心业务实体 (`Vehicle`, `CarFollowingSegment`) 及抽象接口。这是系统的“单一事实来源”。
-3.  **应用层 (Application)**: 编排整个工作流。连接数据加载器、辨识器与可视化器。
-4.  **算法辨识层 (Identification)**: 实现具体的物理基准驱动风格辨识算法。
+### 2. 领域层 (Domain Layer)
+定义了系统的核心语义：`Vehicle` (车辆) 与 `CarFollowingSegment` (跟车片段)。
+- **物理契约**：所有算法均以 `CarFollowingSegment` 为标准输入，确保了数据格式的无关性（CSV 或 JSON 均可）。
+- **文件**：[models.py](file://src/domain/models.py)
 
-```mermaid
-flowchart TB
-    subgraph App[应用服务]
-        direction TB
-        Service[辨识服务 IdentificationService]
-    end
+### 3. 辨识算法层 (Identification Layer)
+实现二阶微分方程的数值解法。
+- **原子化计算**：将复杂的微分方程离散化为 `step_physics` 方法。
+- **策略模式**：继承自 `BaseIdentifier` 接口，支持未来扩展（如 RL 辨识器）。
+- **文件**：[second_order_id.py](file://src/identification/second_order_id.py)
 
-    subgraph Infrastructure[基础设施层]
-        direction LR
-        Factory[加载工厂 DataLoaderFactory]
-        CSV[CSV 加载器]
-        JSON[JSON 加载器]
-    end
+### 4. 应用服务层 (Application/Service Layer)
+负责跨模块协作。
+- **ExperimentRunner**：自动化流水线，负责循环调用辨识器、收集统计数据并驱动可视化。
+- **文件**：[run_param_sweep.py](file://scripts/run_param_sweep.py)
 
-    subgraph Domain[领域实体]
-        direction LR
-        Segment[跟车片段 Segment]
-        Veh[车辆 Vehicle]
-        BaseID[辨识接口 BaseIdentifier]
-    end
-
-    Service --> Factory
-    Factory --> CSV
-    Factory --> JSON
-    CSV --> Segment
-    JSON --> Segment
-    Service --> BaseID
-    BaseID -.-> StyleID[风格辨识算法 StyleIdentifier]
-    Segment --> Veh
-```
-
-## 🔄 核心工作流：从数据到决策
-
-系统处理跟车数据的标准化管线如下：
+## 🔄 核心数据流
 
 ```mermaid
 sequenceDiagram
-    participant U as 用户/入口脚本
-    participant S as 辨识服务 Service
-    participant F as 加载工厂 Factory
-    participant L as 加载器 Loader
-    participant A as 辨识算法 Algo
-    participant V as 可视化器 Viz
+    participant Config as 配置管理器
+    participant Data as 数据加载器
+    participant Runner as 实验运行器
+    participant Algo as 二阶辨识器
+    participant Viz as 可视化引擎
 
-    U->>S: run_on_file(路径)
-    S->>F: get_loader(扩展名)
-    F->>L: load_data()
-    L-->>S: List[跟车片段 Segment]
+    Config->>Runner: 注入 wn, zeta, targets 列表
+    Data->>Runner: 提供 CarFollowingSegment
     
-    loop 针对每个片段
-        S->>A: identify(片段)
-        A-->>S: 辨识结果 DataFrame
-        S->>V: plot_segment(片段, 辨识结果)
-        V-->>U: 保存 PNG 至 output/figures/
+    loop 遍历 (wn, zeta) 组合
+        Runner->>Algo: identify(segment, params)
+        Algo->>Algo: 调用 step_physics (10s 推演)
+        Algo-->>Runner: 返回残差流 + 预测射线 (rays)
     end
     
-    S-->>U: 汇总报表
+    Runner->>Viz: 汇总所有射线与结果
+    Viz-->>Runner: 输出 28x36 高清全景图
+    Runner-->>User: 导出 ultimate_master_report.csv
 ```
 
-## 📦 核心领域模型
+## 🏗️ 核心设计模式
 
-### `Vehicle` (车辆实体)
-记录单个车辆随时间变化的状态。存储带时间戳的坐标、速度与加速度。
-- **源码参考**: [models.py](file://src/domain/models.py#L7)
-
-### `CarFollowingSegment` (跟车片段)
-分析的基本单元。封装了自车 (Ego) 与目标车 (Target) 组成的连续跟车事件。
-- **关键属性**: `relative_distance` (相对距离), `relative_velocity` (相对速度), `duration` (持续时长)。
-- **源码参考**: [models.py](file://src/domain/models.py#L32)
-
-## 🏗️ 设计模式与工程实践
-
-### 1. 工厂模式 (Factory Pattern)
-利用 `DataLoaderFactory` 根据文件扩展名动态路由加载逻辑。这使得添加新数据源（如 Parquet 或数据库）只需扩展一个新的 Loader 子类。
-- **源码参考**: [factory.py](file://src/infrastructure/loaders/factory.py)
-
-### 2. 策略模式 (Strategy Pattern)
-通过定义 `BaseIdentifier` 接口，系统可以支持多种辨识策略（如基于物理模型 vs. 基于深度学习），且无需修改应用层逻辑。
-
-### 3. 依赖注入 (Dependency Injection)
-`IdentificationService` 在构造时接收辨识器与可视化器实例。这为单元测试的 Mock 注入及不同场景的灵活配置提供了便利。
+| 模式 | 应用位置 | 作用 |
+|------|----------|------|
+| **单例模式 (Singleton)** | `ConfigManager` | 确保全局配置唯一，避免内存冗余。 |
+| **策略模式 (Strategy)** | `BaseIdentifier` | 算法可插拔，方便对比不同阶数的物理模型。 |
+| **组合模式 (Composition)** | `MatplotlibVisualizer` | 全景报告由多个独立的 Panel 组合而成。 |
+| **工厂模式 (Factory)** | `DataLoaderFactory` | 屏蔽了 CSV/JSON 解析差异。 |
 
 ---
 
 **章节参考源**
-- [src/domain/models.py](file://src/domain/models.py)
-- [src/infrastructure/loaders/factory.py](file://src/infrastructure/loaders/factory.py)
-- [src/application/services/identification_service.py](file://src/application/services/identification_service.py)
+- [src/core/config_manager.py](file://src/core/config_manager.py)
+- [scripts/run_param_sweep.py](file://scripts/run_param_sweep.py)
 
 *由 [Mini-Wiki v3.0.6](https://github.com/trsoliu/mini-wiki) 自动生成 | 2026-03-14*

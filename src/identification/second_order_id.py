@@ -3,112 +3,144 @@ import pandas as pd
 from typing import Dict, Any, List
 from src.domain.interfaces import BaseIdentifier
 from src.domain.models import CarFollowingSegment
+from src.core.config_manager import ConfigManager
 
 class SecondOrderStyleIdentifier(BaseIdentifier):
     """
-    基于二阶控制理论与物理约束的前馈跟车风格辨识器 (V13.1 物理基准归零版)
+    重构后的二阶辨识器：完全参数化，逻辑解耦。
     """
-    def __init__(self, 
-                 styles_config: Dict[float, Dict[str, float]] = None,
-                 window_size: int = 100, 
-                 dt: float = 0.1, 
-                 d0: float = 0.0, # 强制默认为 0，消除时距漂移
-                 jerk_max: float = 2.5, 
-                 a_max: float = 3.0, 
-                 a_min: float = -5.0,
-                 zeta: float = 1.0):
+    def __init__(self, config: Dict[float, Dict[str, float]] = None, **kwargs):
+        self.cfg = ConfigManager()
         
-        if styles_config is None:
-            self.styles_config = {1.0: {'wn': 1.0}, 1.5: {'wn': 0.6}, 2.0: {'wn': 0.4}}
-        else:
-            self.styles_config = styles_config
-            
-        self.window_size = window_size
-        self.dt = dt
-        self.d0 = d0
-        self.jerk_max = jerk_max
-        self.a_max = a_max
-        self.a_min = a_min
-        self.zeta = zeta # 全局默认阻尼比
+        # 物理限制从配置中加载
+        self.dt = self.cfg.get('physics.dt', 0.1)
+        self.d0 = self.cfg.get('physics.d0', 0.0)
+        self.jerk_max = self.cfg.get('physics.jerk_max', 2.5)
+        self.a_max = self.cfg.get('physics.a_max', 3.0)
+        self.a_min = self.cfg.get('physics.a_min', -5.0)
         
-        self.params = {}
+        # 辨识配置
+        self.window_size = kwargs.get('window_size', self.cfg.get('identification.window_size_default', 100))
+        self.pred_horizon = self.cfg.get('identification.pred_horizon', 100)
+        
+        # 初始化风格矩阵
+        self.styles_config = config or self._get_default_styles()
+        self.params = self._precompute_params()
+
+    def _get_default_styles(self):
+        # 从配置中构造默认风格组合
+        thws = self.cfg.get('identification.targets.thw')
+        wns = self.cfg.get('identification.targets.wn')
+        # 默认匹配 (这里可以根据业务逻辑调整)
+        return {t: {'wn': 0.8, 'zeta': 1.0} for t in thws}
+
+    def _precompute_params(self):
+        params = {}
         for thw, conf in self.styles_config.items():
-            wn = conf.get('wn', 0.6)
-            z = conf.get('zeta', self.zeta)
-            denom = 1 + 2 * z * wn * thw
-            self.params[thw] = {
+            wn = conf.get('wn', 0.8)
+            zeta = conf.get('zeta', 1.0)
+            denom = 1 + 2 * zeta * wn * thw
+            params[thw] = {
                 'tau': thw / denom if denom != 0 else 0.001,
                 'alpha': 1.0 / denom,
-                'Kv': (2 * z * wn) / denom,
+                'Kv': (2 * zeta * wn) / denom,
                 'Kp': (wn ** 2) / denom,
-                'wn': wn,
-                'zeta': z
+                'wn': wn, 'zeta': zeta
             }
+        return params
+
+    def step_physics(self, state: Dict[str, float], cmd_p: Dict[str, float], thw_target: float) -> Dict[str, float]:
+        """
+        核心物理步进逻辑：解耦单帧计算，确保多处复用一致性。
+        """
+        e = state['d'] - (thw_target * state['v'] + self.d0)
+        dv = state['v_l'] - state['v']
+        
+        # 指令生成
+        a_cmd = cmd_p['alpha'] * state['a_l'] + cmd_p['Kv'] * dv + cmd_p['Kp'] * e
+        
+        # 延迟与硬约束
+        a_raw = state['a_prev'] + (self.dt / cmd_p['tau']) * (a_cmd - state['a_prev'])
+        j_lim = np.clip((a_raw - state['a_prev']) / self.dt, -self.jerk_max, self.jerk_max)
+        a_curr = np.clip(state['a_prev'] + j_lim * self.dt, self.a_min, self.a_max)
+        
+        # 积分
+        v_next = state['v'] + a_curr * self.dt
+        d_next = state['d'] + (state['v_l'] - v_next) * self.dt
+        
+        return {'a': a_curr, 'v': v_next, 'd': d_next, 'e': e, 'a_cmd': a_cmd}
 
     def simulate_segment(self, segment: CarFollowingSegment, thw: float, wn: float, zeta: float = 1.0) -> Dict[str, np.ndarray]:
         df = segment.to_dataframe()
         N = len(df)
-        a_sim, v_sim, d_sim = np.zeros(N), np.zeros(N), np.zeros(N)
-        if N == 0: return {}
-        v_ego, v_lead = df['ego_velocity'].values, df['lead_velocity'].values
-        a_lead, dist = df['lead_acceleration'].values, df['relative_distance'].values
+        res = {'acc': np.zeros(N), 'v': np.zeros(N), 'thw': np.zeros(N)}
+        if N == 0: return res
+        
+        # 初始化状态
+        state = {'v': df['ego_velocity'].iloc[0], 'd': df['relative_distance'].iloc[0], 
+                 'a_prev': df['ego_acceleration'].iloc[0], 'v_l': df['lead_velocity'].iloc[0], 'a_l': df['lead_acceleration'].iloc[0]}
+        
         denom = 1 + 2 * zeta * wn * thw
-        p = {'tau': thw / denom, 'alpha': 1.0 / denom, 'Kv': (2 * zeta * wn) / denom, 'Kp': (wn ** 2) / denom}
-        a_sim[0], v_sim[0], d_sim[0] = df['ego_acceleration'].values[0], v_ego[0], dist[0]
-        for t in range(1, N):
-            e = d_sim[t-1] - (thw * v_sim[t-1] + self.d0)
-            dv = v_lead[t] - v_sim[t-1]
-            a_cmd = p['alpha'] * a_lead[t] + p['Kv'] * dv + p['Kp'] * e
-            a_raw = a_sim[t-1] + (self.dt / p['tau']) * (a_cmd - a_sim[t-1])
-            j_lim = np.clip((a_raw - a_sim[t-1]) / self.dt, -self.jerk_max, self.jerk_max)
-            a_sim[t] = np.clip(a_sim[t-1] + j_lim * self.dt, self.a_min, self.a_max)
-            v_sim[t] = v_sim[t-1] + a_sim[t] * self.dt
-            d_sim[t] = d_sim[t-1] + (v_lead[t] - v_sim[t]) * self.dt
-        return {'acc': a_sim, 'v': v_sim, 'thw': d_sim / np.clip(v_sim, 0.5, 100.0)}
+        cmd_p = {'tau': thw / denom, 'alpha': 1.0 / denom, 'Kv': (2 * zeta * wn) / denom, 'Kp': (wn ** 2) / denom}
+        
+        for t in range(N):
+            state['v_l'] = df['lead_velocity'].iloc[t]
+            state['a_l'] = df['lead_acceleration'].iloc[t]
+            out = self.step_physics(state, cmd_p, thw)
+            res['acc'][t], res['v'][t] = out['a'], out['v']
+            res['thw'][t] = out['d'] / max(0.5, out['v'])
+            state['v'], state['d'], state['a_prev'] = out['v'], out['d'], out['a']
+            
+        return res
 
     def identify(self, segment: CarFollowingSegment) -> pd.DataFrame:
         df = segment.to_dataframe()
         N = len(df)
         if N < self.window_size: return pd.DataFrame()
-        max_pred_steps = 100 
+        
         results = []
-        v_ev_arr, v_lv_arr = df['ego_velocity'].values, df['lead_velocity'].values
-        a_ev_arr, a_lv_arr = df['ego_acceleration'].values, df['lead_acceleration'].values
-        dist_arr, timestamps = df['relative_distance'].values, df['timestamp'].values
         for start_idx in range(0, N - self.window_size + 1, 1):
             window_rays, window_acc_rays, cost, valid_ratio = {}, {}, {}, {}
+            
             for thw, p in self.params.items():
+                # 1. 成本计算 (固定窗口)
                 a_sim_w = np.zeros(self.window_size)
-                a_sim_w[0], v_w, d_w, valid_count = a_ev_arr[start_idx], v_ev_arr[start_idx], dist_arr[start_idx], 0
-                for t in range(1, self.window_size):
-                    idx = start_idx + t
-                    e = d_w - (thw * v_w + self.d0)
-                    dv = v_lv_arr[idx] - v_w
-                    a_cmd = p['alpha'] * a_lv_arr[idx] + p['Kv'] * dv + p['Kp'] * e
-                    a_raw = a_sim_w[t-1] + (self.dt / p['tau']) * (a_cmd - a_sim_w[t-1])
-                    j_lim = np.clip((a_raw - a_sim_w[t-1]) / self.dt, -self.jerk_max, self.jerk_max)
-                    a_sim_w[t] = np.clip(a_sim_w[t-1] + j_lim * self.dt, self.a_min, self.a_max)
-                    v_w += a_sim_w[t] * self.dt; d_w += (v_lv_arr[idx] - v_w) * self.dt
-                    if not ((e < -2.0 and a_cmd < -0.5 and a_ev_arr[idx] > 0.5) or (e > 2.0 and a_cmd > 0.5 and a_ev_arr[idx] < -0.5)): valid_count += 1
-                cost[thw] = np.mean(np.abs(a_ev_arr[start_idx:start_idx+self.window_size] - a_sim_w))
-                valid_ratio[thw] = valid_count / (self.window_size - 1)
+                state = {'v': df['ego_velocity'].iloc[start_idx], 'd': df['relative_distance'].iloc[start_idx], 
+                         'a_prev': df['ego_acceleration'].iloc[start_idx]}
+                v_arr, d_arr, a_arr = df['ego_velocity'].values, df['relative_distance'].values, df['ego_acceleration'].values
+                v_l_arr, a_l_arr = df['lead_velocity'].values, df['lead_acceleration'].values
                 
-                # 稳态推演射线
+                valid_count = 0
+                for t in range(self.window_size):
+                    idx = start_idx + t
+                    state['v_l'], state['a_l'] = v_l_arr[idx], a_l_arr[idx]
+                    out = self.step_physics(state, p, thw)
+                    a_sim_w[t] = out['a']
+                    state['v'], state['d'], state['a_prev'] = out['v'], out['d'], out['a']
+                    # 方向一致性校验
+                    if not ((out['e'] < -2.0 and out['a_cmd'] < -0.5 and a_arr[idx] > 0.5) or 
+                            (out['e'] > 2.0 and out['a_cmd'] > 0.5 and a_arr[idx] < -0.5)):
+                        valid_count += 1
+
+                cost[thw] = np.mean(np.abs(a_arr[start_idx:start_idx+self.window_size] - a_sim_w))
+                valid_ratio[thw] = valid_count / self.window_size
+
+                # 2. 长程推演 (10s)
                 thw_r, acc_r = [], []
-                v_curr, d_curr, a_prev_r = v_ev_arr[start_idx], dist_arr[start_idx], a_ev_arr[start_idx]
-                for t in range(max_pred_steps):
-                    idx = min(start_idx + t, N-1)
-                    curr_a_lv, curr_v_lv = a_lv_arr[idx], v_lv_arr[idx]
-                    e_r = d_curr - (thw * v_curr + self.d0)
-                    dv_r = curr_v_lv - v_curr
-                    a_cmd_r = p['alpha'] * curr_a_lv + p['Kv'] * dv_r + p['Kp'] * e_r
-                    a_raw_r = a_prev_r + (self.dt / p['tau']) * (a_cmd_r - a_prev_r)
-                    j_r = np.clip((a_raw_r - a_prev_r) / self.dt, -self.jerk_max, self.jerk_max)
-                    a_curr_r = np.clip(a_prev_r + j_r * self.dt, self.a_min, self.a_max)
-                    v_curr += a_curr_r * self.dt; d_curr += (curr_v_lv - v_curr) * self.dt
-                    thw_r.append(d_curr / max(0.5, v_curr)); acc_r.append(a_curr_r); a_prev_r = a_curr_r
-                    if t > 30 and abs(e_r) < 0.05 and abs(dv_r) < 0.05: break
+                state_r = {'v': v_arr[start_idx], 'd': d_arr[start_idx], 'a_prev': a_arr[start_idx]}
+                for t in range(self.pred_horizon):
+                    idx = min(start_idx + t, N - 1)
+                    state_r['v_l'], state_r['a_l'] = v_l_arr[idx], a_l_arr[idx]
+                    out = self.step_physics(state_r, p, thw)
+                    thw_r.append(out['d']/max(0.5, out['v'])); acc_r.append(out['a'])
+                    state_r['v'], state_r['d'], state_r['a_prev'] = out['v'], out['d'], out['a']
+                    if t > 30 and abs(out['e']) < 0.05: break
                 window_rays[thw], window_acc_rays[thw] = np.array(thw_r), np.array(acc_r)
+
             best_thw = min(cost, key=cost.get)
-            results.append({"start_time": timestamps[start_idx], "identified_style": best_thw, "valid_ratio": valid_ratio[best_thw], "rays": window_rays, "acc_rays": window_acc_rays, **{f"cost_{k}": v for k, v in cost.items()}})
+            results.append({
+                "start_time": df['timestamp'].iloc[start_idx], "identified_style": best_thw,
+                "valid_ratio": valid_ratio[best_thw], "rays": window_rays, "acc_rays": window_acc_rays,
+                **{f"cost_{k}": v for k, v in cost.items()}
+            })
         return pd.DataFrame(results)
